@@ -1,0 +1,11 @@
+pandas
+duckdb
+streamlit
+plotly
+fastmcp
+ollama
+groq
+sqlglot
+python-dotenv
+openpyxl
+pytest
