@@ -3,3 +3,4 @@ __pycache__/
 .env
 data/*.csv
 chart_*.html
+agent_chart.html
