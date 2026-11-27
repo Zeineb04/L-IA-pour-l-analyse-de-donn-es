@@ -1,4 +1,5 @@
-"""Génération de SQL + exécution + auto-correction via Ollama."""
+
+import re
 import ollama
 import duckdb
 from src.sql.validator import is_safe_sql
@@ -9,21 +10,49 @@ Tu dois répondre UNIQUEMENT avec une requête SQL SELECT valide.
 N'écris aucun texte avant ou après la requête.
 N'utilise jamais DROP, DELETE, UPDATE, INSERT, CREATE, ALTER, COPY, ATTACH.
 Utilise UNIQUEMENT le nom de table et les colonnes fournis.
+
+Règles importantes :
+- Une ligne de la table = un enregistrement (ex : un point de charge). Pour compter
+  des enregistrements, utilise COUNT(*).
+- Pour compter des entités uniques (ex : des stations), utilise COUNT(DISTINCT colonne_identifiant).
+  Une colonne d'identifiant a un nombre de valeurs distinctes inférieur au nombre de lignes
+  quand l'entité apparaît sur plusieurs lignes.
+- Une colonne qui contient un total propre à un groupe répété sur chaque ligne du groupe
+  (ex : nbre_pdc = nombre de points de charge de la station) ne doit JAMAIS être additionnée
+  avec SUM ou AVG. Utilise COUNT(*), ou MAX par groupe.
+- Pour un classement d'entités (top N), utilise GROUP BY pour qu'une entité n'apparaisse
+  qu'une seule fois, puis ORDER BY ... DESC LIMIT N.
+  Exemples :
+Question : Combien y a-t-il d'enregistrements au total ?
+SQL : SELECT COUNT(*) FROM clean
+
 """
 
 
 def get_schema(con, table: str = "clean") -> str:
-    """Retourne le schéma + 3 lignes d'exemple."""
+    """Retourne le schéma (avec nombre de valeurs distinctes) + 3 lignes d'exemple."""
+    n_rows = con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
     cols = con.execute(f'DESCRIBE "{table}"').fetchall()
-    schema_lines = [f"- {c[0]} ({c[1]})" for c in cols]
+    schema_lines = []
+    id_cols = []
+    for c in cols:
+        name = c[0]
+        distinct = con.execute(
+            f'SELECT COUNT(DISTINCT "{name}") FROM "{table}"'
+        ).fetchone()[0]
+        line = f"- {name} ({c[1]}, {distinct} valeurs distinctes)"
+        # Colonne d'identifiant dont les valeurs se répètent : une entité sur plusieurs lignes
+        if re.search(r"(^|_)id(_|$)", name) and 1 < distinct < n_rows:
+            line += " <- identifiant répété : utiliser COUNT(DISTINCT) pour compter les entités"
+            id_cols.append(name)
+        schema_lines.append(line)
     sample = con.execute(f'SELECT * FROM "{table}" LIMIT 3').fetchdf()
     sample_str = sample.to_string(index=False)
     return (
-        f"Nom de la table : {table}\n\n"
+        f"Nom de la table : {table} ({n_rows} lignes)\n\n"
         f"Colonnes :\n" + "\n".join(schema_lines) +
         f"\n\nExemples de lignes :\n{sample_str}"
     )
-
 
 def text_to_sql(question: str, schema: str, model: str = "qwen2.5-coder:3b") -> dict:
     """Génère une requête SQL à partir d'une question."""
@@ -98,11 +127,13 @@ def run_sql_with_retry(
                 f"Corrige la requête.\nQuestion originale : {question}"
             )
 
-    return {
-        "success": False,
-        "sql": None,
-        "data": None,
-        "attempts": max_retries,
-        "history": history,
-        "error": "Échec après plusieurs tentatives"
-    }
+        hint = ""
+    if id_cols:
+        hint = (f"\n\nExemple : pour compter les entités uniques, utilise "
+                f"SELECT COUNT(DISTINCT {id_cols[0]}) FROM {table}")
+    return (
+        f"Nom de la table : {table} ({n_rows} lignes)\n\n"
+        f"Colonnes :\n" + "\n".join(schema_lines) +
+        hint +
+        f"\n\nExemples de lignes :\n{sample_str}"
+    )
